@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Candidates · LHS</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <div class="brand"><span class="logo" aria-hidden="true">LHS</span><span>Candidate Lifecycle</span></div>
+    <nav id="main-nav" class="nav" aria-label="Main"></nav>
+    <div class="user">
+      <label for="role-switch" class="sr-only">Signed in as</label>
+      <select id="role-switch">
+        <option value="recruiter">Recruitment Consultant</option>
+        <option value="candidate">Candidate portal</option>
+      </select>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1"></main>
+
+  <footer class="footer">
+    <span>ICT Labour Hire System · Module 1: Candidate Lifecycle Management · Prototype – data is stored in this browser only</span>
+    <button type="button" id="reset-demo" class="link-btn">Reset demo data</button>
+  </footer>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+  <!-- Classic scripts (not ES modules) so the app runs straight from the file system without a web server. -->
+  <script src="js/util.js"></script>
+  <script src="js/domain.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/views/dashboard.js"></script>
+  <script src="js/views/list.js"></script>
+  <script src="js/views/form.js"></script>
+  <script src="js/views/detail.js"></script>
+  <script src="js/views/tab-profile.js"></script>
+  <script src="js/views/tab-screening.js"></script>
+  <script src="js/views/tab-onboarding.js"></script>
+  <script src="js/views/tab-documents.js"></script>
+  <script src="js/views/tab-privacy.js"></script>
+  <script src="js/views/questionnaires.js"></script>
+  <script src="js/views/duplicates.js"></script>
+  <script src="js/views/compliance.js"></script>
+  <script src="js/views/portal.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
