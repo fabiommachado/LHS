@@ -78,7 +78,14 @@ p { margin: .25rem 0 .75rem; }
 .nav a { padding: .4rem .7rem; border-radius: 6px; text-decoration: none; color: var(--muted); }
 .nav a:hover { background: var(--surface-2); color: var(--text); }
 .nav a[aria-current="page"] { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+.user { display: flex; align-items: center; gap: .75rem; }
 .user select { padding: .35rem .5rem; }
+.sync { font-size: .8rem; color: var(--muted); white-space: nowrap; }
+.sync::before { content: "●"; margin-right: .3rem; }
+.sync-ok::before { color: var(--ok); }
+.sync-busy::before { color: var(--warn); }
+.sync-error { color: var(--bad); }
+.sync-error::before { color: var(--bad); }
 
 main { flex: 1; width: 100%; max-width: 1280px; margin: 0 auto; padding: 1.5rem; }
 main:focus { outline: none; }

@@ -9,10 +9,11 @@ LHS.tabs = LHS.tabs || {};
   const { dialog, field, toast } = LHS.ui;
 
   // Privacy Act APP 12 access request: everything held about the candidate, minus encrypted secrets.
-  function exportData(c) {
+  async function exportData(c) {
     const copy = JSON.parse(JSON.stringify(c));
     if (copy.onboarding && copy.onboarding.bank) copy.onboarding.bank = { note: 'Bank details held (encrypted); provided on verified request', last4: copy.onboarding.bank.last4 };
-    copy.auditTrail = LHS.store.auditLog(c.id);
+    delete copy.version;
+    copy.auditTrail = await LHS.store.fetchAuditLog(c.id);
     const blob = new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -22,8 +23,9 @@ LHS.tabs = LHS.tabs || {};
     LHS.store.audit('Exported personal data (access request)', c.id, fullName(c));
   }
 
-  LHS.tabs.privacy = function (c, el, refresh) {
-    const log = LHS.store.auditLog(c.id);
+  const auditRows = (log) => html`${log.map((a) => html`<tr><td class="nowrap">${fmtDateTime(a.at)}</td><td>${a.user}</td><td>${a.action}</td><td>${a.details}</td></tr>`)}`;
+
+  LHS.tabs.privacy = function (c, el) {
     const retention = D.retentionDue(c);
 
     el.innerHTML = html`
@@ -51,13 +53,17 @@ LHS.tabs = LHS.tabs || {};
       </div>
       <section class="card">
         <h2>Audit trail</h2>
-        <div class="table-wrap"><table class="table compact"><thead><tr><th>When</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody>
-          ${log.map((a) => html`<tr><td class="nowrap">${fmtDateTime(a.at)}</td><td>${a.user}</td><td>${a.action}</td><td>${a.details}</td></tr>`)}
-        </tbody></table></div>
+        <div class="table-wrap"><table class="table compact"><thead><tr><th>When</th><th>User</th><th>Action</th><th>Details</th></tr></thead>
+          <tbody id="audit-rows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+        </table></div>
       </section>`.s;
 
+    LHS.store.fetchAuditLog(c.id)
+      .then((log) => { const body = el.querySelector('#audit-rows'); if (body) body.innerHTML = auditRows(log).s; })
+      .catch((e) => toast(`Could not load the audit trail: ${e.message}`, 'error'));
+
     LHS.tabs.onAction(el, {
-      export: () => exportData(c),
+      export: () => exportData(c).catch((e) => toast(`Export failed: ${e.message}`, 'error')),
       erase: () => dialog({
         title: 'Erase candidate',
         body: html`<p>This permanently removes all personal information for <strong>${fullName(c)}</strong>. An anonymous record is kept so the audit trail stays intact.</p>

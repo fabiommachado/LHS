@@ -1,46 +1,32 @@
-/* Data layer. Persists to localStorage; swap load/save for API calls when the backend exists. */
+/*
+  Data layer. Views read and write an in-memory state synchronously; persistence depends on how the page was opened:
+    - API mode (served over http/https by the Candidates API): changes are sent to the API in order, in the background,
+      and the server's response replaces the local copy. If the server rejects a change, the user is told and the
+      candidate is reloaded from the server.
+    - Offline mode (index.html opened from disk): everything is kept in this browser's localStorage, as a prototype.
+*/
 window.LHS = window.LHS || {};
 
 (function (LHS) {
   'use strict';
-  const { uid, addDaysISO, fullName } = LHS.util;
+  const { uid, fullName } = LHS.util;
   const STORAGE_KEY = 'lhs.candidates.v1';
+  const SESSION_KEY = 'lhs.candidates.session';
+  const API_BASE = window.LHS_API_BASE || '';
+  const apiMode = !!window.LHS_API_BASE || /^https?:$/.test(location.protocol);
 
   let state = null;
   const listeners = new Set();
-
-  function load() {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      state = saved ? JSON.parse(saved) : seed();
-    } catch (e) {
-      console.error('Could not read saved data, starting fresh', e);
-      state = seed();
-    }
-    state.session = state.session || { role: 'recruiter', userName: 'Recruitment Consultant', candidateId: null };
-    save();
-  }
-
-  function save() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch (e) {
-      LHS.ui && LHS.ui.toast('Could not save – browser storage is full or unavailable.', 'error');
-      throw e;
-    }
-    listeners.forEach((fn) => fn());
-  }
-
+  const notify = () => listeners.forEach((fn) => fn());
   const subscribe = (fn) => { listeners.add(fn); return () => listeners.delete(fn); };
 
-  // ---- Audit log (req 3.10.2 / NFR: all create/update/delete logged with user and timestamp) ----
-  function audit(action, candidateId, details) {
-    state.audit.unshift({
-      id: uid(), at: new Date().toISOString(), user: currentUserLabel(), action,
-      candidateId: candidateId || null, details: details || '',
-    });
-    if (state.audit.length > 5000) state.audit.length = 5000;
+  // ======================= Session (simulated sign-in until Module 10) =======================
+
+  function loadSession() {
+    try { return JSON.parse(localStorage.getItem(SESSION_KEY)) || null; } catch (e) { return null; }
   }
+  const defaultSession = () => ({ role: 'recruiter', userName: 'Recruitment Consultant', candidateId: null });
+  const saveSession = () => localStorage.setItem(SESSION_KEY, JSON.stringify(state.session));
 
   function currentUserLabel() {
     const s = state.session;
@@ -51,7 +37,183 @@ window.LHS = window.LHS || {};
     return s.userName;
   }
 
-  // ---- Candidates ----
+  // ======================= API transport =======================
+
+  async function request(method, path, body) {
+    const res = await fetch(`${API_BASE}/api${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-LHS-User': encodeURIComponent(currentUserLabel()) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const isJson = (res.headers.get('content-type') || '').includes('json');
+    const data = res.status === 204 ? null : isJson ? await res.json() : null;
+    if (!res.ok) {
+      const err = new Error((data && (data.detail || data.title)) || `The server returned ${res.status}.`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  // Writes run one at a time, in order, so the server sees changes in the sequence the user made them.
+  const queue = [];
+  let working = false;
+  let lastError = null;
+  const localRev = new Map();   // candidate id -> count of local edits, to avoid overwriting newer unsaved edits
+  const bump = (id) => localRev.set(id, (localRev.get(id) || 0) + 1);
+
+  function enqueue(op) {
+    return new Promise((resolve, reject) => {
+      queue.push({ ...op, resolve, reject });
+      notify();
+      pump();
+    });
+  }
+
+  async function pump() {
+    if (working) return;
+    working = true;
+    while (queue.length) {
+      const op = queue.shift();
+      try {
+        const result = await run(op);
+        lastError = null;
+        op.resolve(result);
+      } catch (err) {
+        lastError = err;
+        op.reject(err);
+        if (!op.quiet) await recover(op, err);
+      }
+      notify();
+    }
+    working = false;
+    notify();
+  }
+
+  // Replace the cached candidate with the server's copy unless the user has edited it again since this request was sent.
+  function acceptServerCopy(doc, revAtSend) {
+    const i = state.candidates.findIndex((c) => c.id === doc.id);
+    if (i < 0) return;
+    if ((localRev.get(doc.id) || 0) === revAtSend) state.candidates[i] = doc;
+    else Object.assign(state.candidates[i], { version: doc.version, createdAt: doc.createdAt, statusHistory: doc.statusHistory });
+  }
+
+  async function run(op) {
+    const rev = op.id ? localRev.get(op.id) || 0 : 0;
+    switch (op.kind) {
+      case 'save': {
+        const c = getCandidate(op.id);
+        if (!c) return null;
+        const body = { candidate: c, audit: op.audit };
+        const doc = c.version ? await request('PUT', `/candidates/${c.id}`, body) : await request('POST', '/candidates', body);
+        acceptServerCopy(doc, rev);
+        return doc;
+      }
+      case 'status': {
+        const doc = await request('POST', `/candidates/${op.id}/status`, { to: op.to, reason: op.reason || null });
+        acceptServerCopy(doc, rev);
+        return doc;
+      }
+      case 'merge': {
+        const doc = await request('POST', `/candidates/${op.id}/merge`, { secondaryId: op.secondaryId });
+        acceptServerCopy(doc, rev);
+        return doc;
+      }
+      case 'erase': return request('POST', `/candidates/${op.id}/erase`, { reason: op.reason });
+      case 'bank': return request('PUT', `/candidates/${op.id}/bank`, op.details);
+      case 'audit': return request('POST', '/audit', op.entry);
+      case 'qsave': return request('PUT', `/questionnaires/${op.q.id}`, op.q);
+      case 'qdelete': return request('DELETE', `/questionnaires/${op.id}`);
+      default: throw new Error(`Unknown operation ${op.kind}`);
+    }
+  }
+
+  // A rejected change: tell the user, drop queued changes for that record, and reload it from the server.
+  async function recover(op, err) {
+    LHS.ui.toast(`Not saved: ${err.message}`, 'error');
+    const ids = [op.id, op.secondaryId].filter(Boolean);
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (ids.includes(queue[i].id)) queue.splice(i, 1)[0].reject(new Error('Cancelled after an earlier error'));
+    }
+    try {
+      for (const id of ids) {
+        const doc = await request('GET', `/candidates/${id}`).catch((e) => { if (e.status === 404) return null; throw e; });
+        const i = state.candidates.findIndex((c) => c.id === id);
+        if (doc && i >= 0) state.candidates[i] = doc;
+        else if (doc) state.candidates.push(doc);
+        else if (i >= 0) state.candidates.splice(i, 1);
+        localRev.delete(id);
+      }
+      if (op.kind === 'qsave' || op.kind === 'qdelete') state.questionnaires = await request('GET', '/questionnaires');
+    } catch (e) {
+      console.error('Could not reload after a failed save', e);
+    }
+    LHS.app.render();
+  }
+
+  const syncState = () => ({ apiMode, pending: queue.length + (working ? 1 : 0), error: lastError });
+
+  // ======================= Offline persistence =======================
+
+  function saveLocal() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ candidates: state.candidates, questionnaires: state.questionnaires, audit: state.audit }));
+    } catch (e) {
+      LHS.ui.toast('Could not save – browser storage is full or unavailable.', 'error');
+      throw e;
+    }
+  }
+
+  // ======================= Loading =======================
+
+  async function load() {
+    const session = loadSession() || defaultSession();
+    if (apiMode) {
+      state = { candidates: [], questionnaires: [], audit: [], session };
+      const [candidates, questionnaires] = await Promise.all([request('GET', '/candidates'), request('GET', '/questionnaires')]);
+      Object.assign(state, { candidates, questionnaires });
+    } else {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch (e) { console.error('Could not read saved data, starting fresh', e); }
+      state = Object.assign(saved || LHS.seed(), { session: (saved && saved.session) || session });
+      saveLocal();
+    }
+    saveSession();
+    notify();
+  }
+
+  // ======================= Audit (req 3.10.2) =======================
+  // In API mode the server writes audit entries for every change itself; only client-side events are posted here.
+
+  function audit(action, candidateId, details) {
+    if (apiMode) {
+      enqueue({ kind: 'audit', quiet: true, entry: { action, candidateId: candidateId || null, details: details || null } }).catch(() => {});
+      return;
+    }
+    state.audit.unshift({ id: uid(), at: new Date().toISOString(), user: currentUserLabel(), action, candidateId: candidateId || null, details: details || '' });
+    if (state.audit.length > 5000) state.audit.length = 5000;
+    saveLocal();
+  }
+
+  const auditLog = (candidateId) => (candidateId ? state.audit.filter((a) => a.candidateId === candidateId) : state.audit);
+
+  // Always returns the latest entries: from the server in API mode (after pending writes), from memory offline.
+  async function fetchAuditLog(candidateId) {
+    if (!apiMode) return auditLog(candidateId);
+    await waitForSync();
+    const entries = await request('GET', `/audit${candidateId ? `?candidateId=${candidateId}` : ''}`);
+    return entries;
+  }
+
+  function waitForSync() {
+    return new Promise((resolve) => {
+      if (!queue.length && !working) return resolve();
+      const off = subscribe(() => { if (!queue.length && !working) { off(); resolve(); } });
+    });
+  }
+
+  // ======================= Candidates =======================
+
   const listCandidates = () => state.candidates.filter((c) => !c.erased);
   const getCandidate = (id) => state.candidates.find((c) => c.id === id && !c.erased) || null;
 
@@ -60,8 +222,11 @@ window.LHS = window.LHS || {};
     const i = state.candidates.findIndex((c) => c.id === candidate.id);
     if (i >= 0) state.candidates[i] = candidate;
     else state.candidates.push(candidate);
-    audit(action || (i >= 0 ? 'Updated candidate' : 'Created candidate'), candidate.id, details || fullName(candidate));
-    save();
+    const auditAction = action || (i >= 0 ? 'Updated candidate' : 'Created candidate');
+    bump(candidate.id);
+    if (apiMode) enqueue({ kind: 'save', id: candidate.id, audit: { action: auditAction, details: details || fullName(candidate) } }).catch(() => {});
+    else audit(auditAction, candidate.id, details || fullName(candidate));
+    notify();
     return candidate;
   }
 
@@ -74,11 +239,18 @@ window.LHS = window.LHS || {};
     return saveCandidate(copy, action, details);
   }
 
+  // The status move is shown immediately; the database re-checks the workflow rules and has the final say.
   function changeStatus(id, to, reason) {
-    return updateCandidate(id, (c) => {
-      c.statusHistory.push({ id: uid(), from: c.status, to, at: new Date().toISOString(), by: currentUserLabel(), reason: reason || '' });
-      c.status = to;
-    }, 'Status changed', `${to}${reason ? ' – ' + reason : ''}`);
+    const c = getCandidate(id);
+    if (!c) throw new Error('Candidate not found');
+    c.statusHistory = [...c.statusHistory, { id: uid(), from: c.status, to, at: new Date().toISOString(), by: currentUserLabel(), reason: reason || '' }];
+    c.status = to;
+    c.updatedAt = new Date().toISOString();
+    bump(id);
+    if (apiMode) enqueue({ kind: 'status', id, to, reason }).catch(() => {});
+    else audit('Status changed', id, `${to}${reason ? ' – ' + reason : ''}`);
+    notify();
+    return c;
   }
 
   // Right to erasure (req 2.10 / 3.10.2): strip all PII, keep an anonymous tombstone so the audit trail stays intact.
@@ -87,161 +259,108 @@ window.LHS = window.LHS || {};
     if (i < 0) return;
     const name = fullName(state.candidates[i]);
     state.candidates[i] = { id, erased: true, erasedAt: new Date().toISOString(), erasureReason: reason };
-    state.audit.forEach((a) => {
-      if (a.candidateId === id) a.details = '[erased]';
-      if (a.user === `Candidate: ${name}`) a.user = 'Candidate: [erased]';
-    });
-    audit('Erased candidate (Privacy Act request)', id, reason);
-    if (state.session.candidateId === id) state.session.candidateId = null;
-    save();
+    if (state.session.candidateId === id) { state.session.candidateId = null; saveSession(); }
+    if (apiMode) {
+      enqueue({ kind: 'erase', id, reason }).catch(() => {});
+    } else {
+      state.audit.forEach((a) => {
+        if (a.candidateId === id) a.details = '[erased]';
+        if (a.user === `Candidate: ${name}`) a.user = 'Candidate: [erased]';
+      });
+      audit('Erased candidate (Privacy Act request)', id, reason);
+    }
+    notify();
   }
 
   function mergeInto(primaryId, secondaryId) {
     const primary = getCandidate(primaryId), secondary = getCandidate(secondaryId);
     const merged = LHS.domain.mergeCandidates(primary, secondary);
     state.candidates = state.candidates.filter((c) => c.id !== secondaryId);
-    state.audit.forEach((a) => { if (a.candidateId === secondaryId) a.candidateId = primaryId; });
-    saveCandidate(merged, 'Merged duplicate', `${fullName(secondary)} merged into ${fullName(primary)}`);
+    const i = state.candidates.findIndex((c) => c.id === primaryId);
+    state.candidates[i] = merged;
+    bump(primaryId);
+    if (apiMode) {
+      enqueue({ kind: 'merge', id: primaryId, secondaryId }).catch(() => {});
+    } else {
+      state.audit.forEach((a) => { if (a.candidateId === secondaryId) a.candidateId = primaryId; });
+      audit('Merged duplicate', primaryId, `${fullName(secondary)} merged into ${fullName(primary)}`);
+    }
+    notify();
   }
 
-  // ---- Screening questionnaires (req 3.1.2) ----
+  // ======================= Bank details (req 3.1.3) =======================
+  // API mode: encrypted and decrypted by the server (reveals are audited there). Offline: Web Crypto in this browser.
+
+  async function saveBank(id, details) {
+    if (apiMode) {
+      const summary = await enqueue({ kind: 'bank', id, details, quiet: true });
+      const c = getCandidate(id);
+      if (c) c.onboarding.bank = summary;
+      notify();
+      return summary;
+    }
+    const enc = await LHS.domain.encrypt({ accountName: details.accountName, bsb: details.bsb.replace('-', ''), account: details.account });
+    updateCandidate(id, (x) => { x.onboarding.bank = { ...enc, last4: details.account.slice(-4), updatedAt: new Date().toISOString() }; }, 'Updated bank details', 'Encrypted');
+    return getCandidate(id).onboarding.bank;
+  }
+
+  async function revealBank(id) {
+    if (apiMode) {
+      await waitForSync();
+      return request('GET', `/candidates/${id}/bank`);
+    }
+    const c = getCandidate(id);
+    const details = await LHS.domain.decrypt(c.onboarding.bank);
+    audit('Revealed bank details', id, fullName(c));
+    return details;
+  }
+
+  // ======================= Screening questionnaires (req 3.1.2) =======================
+
   const listQuestionnaires = () => state.questionnaires;
   const getQuestionnaire = (id) => state.questionnaires.find((q) => q.id === id) || null;
 
   function saveQuestionnaire(q) {
     const i = state.questionnaires.findIndex((x) => x.id === q.id);
     if (i >= 0) state.questionnaires[i] = q; else state.questionnaires.push(q);
-    audit(i >= 0 ? 'Updated questionnaire' : 'Created questionnaire', null, q.roleType);
-    save();
+    if (apiMode) enqueue({ kind: 'qsave', q }).catch(() => {});
+    else audit(i >= 0 ? 'Updated questionnaire' : 'Created questionnaire', null, q.roleType);
+    notify();
   }
 
   function deleteQuestionnaire(id) {
     const q = getQuestionnaire(id);
     state.questionnaires = state.questionnaires.filter((x) => x.id !== id);
-    audit('Deleted questionnaire', null, q ? q.roleType : id);
-    save();
+    if (apiMode) enqueue({ kind: 'qdelete', id }).catch(() => {});
+    else audit('Deleted questionnaire', null, q ? q.roleType : id);
+    notify();
   }
 
-  // ---- Session (simulated login; real auth/MFA/SSO is Module 10) ----
+  // ======================= Session =======================
+
   const session = () => state.session;
   function setSession(patch) {
     Object.assign(state.session, patch);
+    saveSession();
     audit('Switched user', state.session.candidateId, state.session.role === 'candidate' ? 'Candidate portal' : 'Recruiter workspace');
-    save();
+    notify();
   }
 
-  const auditLog = (candidateId) => (candidateId ? state.audit.filter((a) => a.candidateId === candidateId) : state.audit);
-
+  // Offline mode only: the database has its own demo data (database/06_demo_data.sql).
   function resetDemoData() {
+    if (apiMode) throw new Error('Demo data is managed in the database in connected mode.');
     localStorage.removeItem(STORAGE_KEY);
-    load();
-  }
-
-  // ---- Seed data so the module is explorable on first open ----
-  function seed() {
-    const d = LHS.domain;
-    const mk = (over) => {
-      const c = Object.assign(d.blankCandidate(), over);
-      c.statusHistory = c.statusHistory.length ? c.statusHistory : [{ id: uid(), from: null, to: c.status, at: c.createdAt, by: 'Seed data', reason: 'Initial import' }];
-      return c;
-    };
-    const q1 = {
-      id: uid(), roleType: 'Cloud Engineer',
-      questions: ['Describe your most recent AWS or Azure migration.', 'What infrastructure-as-code tools have you used in production?', 'Are you comfortable working on-site in Canberra 3 days a week?'],
-      requiredSkills: [{ name: 'AWS', weight: 3 }, { name: 'Terraform', weight: 2 }, { name: 'Kubernetes', weight: 2 }, { name: 'Python', weight: 1 }],
-    };
-    const q2 = {
-      id: uid(), roleType: 'Business Analyst',
-      questions: ['Walk through a requirements elicitation you led in government.', 'Which modelling notations (BPMN, UML) do you use?', 'Experience with Digital Service Standard?'],
-      requiredSkills: [{ name: 'Requirements analysis', weight: 3 }, { name: 'BPMN', weight: 2 }, { name: 'Stakeholder engagement', weight: 3 }],
-    };
-    const now = new Date().toISOString();
-    const ref = (name, company, status) => ({ id: uid(), name, company, relationship: 'Former manager', email: '', phone: '', status, requestedDate: addDaysISO(-20), response: status === 'Received' ? 'Strong technical skills, reliable, would re-hire.' : '' });
-    const doc = (type, name, expiry) => ({ id: uid(), type, name, fileName: name.toLowerCase().replace(/\s+/g, '-') + '.pdf', uploadedAt: now, expiry: expiry || '', uploadedBy: 'Seed data' });
-
-    const candidates = [
-      mk({
-        firstName: 'Priya', lastName: 'Raman', email: 'priya.raman@example.com', phone: '0412 345 678', location: 'Canberra, ACT',
-        currentEmployer: 'Department of Home Affairs', currentTitle: 'Senior Cloud Engineer', status: 'Active', abn: '51 824 753 556',
-        availabilityDate: addDaysISO(120), salary: { basis: 'Daily rate', amount: '1150' },
-        skills: [{ name: 'AWS', years: 8 }, { name: 'Terraform', years: 5 }, { name: 'Kubernetes', years: 4 }, { name: 'Python', years: 6 }],
-        certifications: [{ id: uid(), name: 'AWS Solutions Architect – Professional', issuer: 'Amazon Web Services', expiry: addDaysISO(25) }],
-        clearance: { level: 'NV1', expiry: addDaysISO(700), issuingAgency: 'AGSVA', verification: 'Verified' },
-        visa: { workRights: 'Australian citizen', type: '', expiry: '', restrictions: '' },
-        source: { channel: 'LinkedIn', detail: 'Recruiter search: AWS NV1 Canberra' },
-        linkedin: { url: 'https://www.linkedin.com/in/priya-raman-example', outreachStatus: 'Interested' },
-        consent: { given: true, date: addDaysISO(-200), method: 'Email', collectionNoticeProvided: true },
-        screenings: [{ id: uid(), date: addDaysISO(-190), questionnaireId: q1.id, roleType: 'Cloud Engineer', answers: [], notes: 'Excellent depth on AWS landing zones.', outcome: 'Pass', ratings: [{ skill: 'AWS', weight: 3, rating: 5 }, { skill: 'Terraform', weight: 2, rating: 4 }, { skill: 'Kubernetes', weight: 2, rating: 4 }, { skill: 'Python', weight: 1, rating: 4 }] }],
-        references: [ref('Tom Nguyen', 'Department of Finance', 'Received')],
-        checks: { police: { status: 'Cleared', date: addDaysISO(-180), expiry: addDaysISO(185) }, wwvp: { applicable: false, status: 'Not applicable', number: '', expiry: '' } },
-        documents: [doc('Resume', 'Priya Raman CV'), doc('TFN declaration', 'TFN declaration'), doc('Super choice form', 'Super choice'), doc('Identity document', 'Passport', addDaysISO(1500)), doc('Qualification', 'BEng Software'), doc('Contractor agreement', 'Signed contractor agreement')],
-        inductions: [{ id: uid(), type: 'WHS', completedDate: addDaysISO(-170), notes: '' }, { id: uid(), type: 'ICT security', completedDate: addDaysISO(-170), notes: '' }],
-        onboarding: { bank: null, super: { fundName: 'AustralianSuper', memberNumber: '12345678', usi: 'STA0100AU' }, agreement: { status: 'Signed', generatedAt: addDaysISO(-175), signedAt: addDaysISO(-172) } },
-        notes: 'Placed with Home Affairs via Cloud Platform SOW.',
-      }),
-      mk({
-        firstName: 'James', lastName: 'O\'Connell', email: 'j.oconnell@example.com', phone: '0423 111 222', location: 'Queanbeyan, NSW',
-        currentEmployer: 'Accenture', currentTitle: 'Business Analyst', status: 'Screening',
-        availabilityDate: addDaysISO(14), salary: { basis: 'Daily rate', amount: '950' },
-        skills: [{ name: 'Requirements analysis', years: 7 }, { name: 'BPMN', years: 5 }, { name: 'Stakeholder engagement', years: 7 }, { name: 'Jira', years: 6 }],
-        clearance: { level: 'Baseline', expiry: addDaysISO(50), issuingAgency: 'AGSVA', verification: 'Pending' },
-        visa: { workRights: 'Australian citizen', type: '', expiry: '', restrictions: '' },
-        source: { channel: 'Referral', detail: 'Referred by Priya Raman' },
-        consent: { given: true, date: addDaysISO(-10), method: 'Email', collectionNoticeProvided: true },
-        references: [ref('Sarah Lee', 'Accenture', 'Requested')],
-      }),
-      mk({
-        firstName: 'Wei', lastName: 'Zhang', email: 'wei.zhang@example.com', phone: '0433 987 654', location: 'Canberra, ACT',
-        currentEmployer: 'Datacom', currentTitle: 'DevOps Engineer', status: 'Bench', availabilityDate: addDaysISO(3),
-        salary: { basis: 'Daily rate', amount: '1000' },
-        skills: [{ name: 'Azure', years: 5 }, { name: 'Kubernetes', years: 4 }, { name: 'Terraform', years: 3 }, { name: 'Go', years: 2 }],
-        clearance: { level: 'Baseline', expiry: addDaysISO(400), issuingAgency: 'AGSVA', verification: 'Verified' },
-        visa: { workRights: 'Visa holder', type: 'Subclass 482', expiry: addDaysISO(45), restrictions: 'Must work in nominated occupation' },
-        source: { channel: 'Job board', detail: 'SEEK' },
-        consent: { given: true, date: addDaysISO(-400), method: 'Candidate portal', collectionNoticeProvided: true },
-        screenings: [{ id: uid(), date: addDaysISO(-380), questionnaireId: q1.id, roleType: 'Cloud Engineer', answers: [], notes: 'Strong on Azure, lighter on AWS.', outcome: 'Pass', ratings: [{ skill: 'AWS', weight: 3, rating: 2 }, { skill: 'Terraform', weight: 2, rating: 4 }, { skill: 'Kubernetes', weight: 2, rating: 4 }, { skill: 'Python', weight: 1, rating: 3 }] }],
-        references: [ref('Ana Costa', 'Datacom', 'Received')],
-        documents: [doc('Visa', 'VEVO check', addDaysISO(45)), doc('Resume', 'Wei Zhang CV')],
-      }),
-      mk({
-        firstName: 'Emma', lastName: 'Walsh', email: 'emma.walsh@example.com', phone: '0400 555 000', location: 'Canberra, ACT',
-        currentEmployer: 'Services Australia', currentTitle: 'Test Analyst', status: 'Prospect', availabilityDate: addDaysISO(60),
-        skills: [{ name: 'Selenium', years: 4 }, { name: 'Test automation', years: 5 }],
-        source: { channel: 'LinkedIn', detail: 'InMail campaign – testers' },
-        linkedin: { url: 'https://linkedin.com/in/emma-walsh-example', outreachStatus: 'InMail sent' },
-      }),
-      mk({
-        firstName: 'Emma', lastName: 'Walsh', email: 'EMMA.WALSH@example.com', phone: '', location: 'Canberra ACT',
-        currentEmployer: 'Services Australia', currentTitle: 'Senior Test Analyst', status: 'Prospect',
-        skills: [{ name: 'Playwright', years: 2 }, { name: 'Test automation', years: 5 }],
-        source: { channel: 'Partner agency', detail: 'Capital Talent Partners' },
-        notes: 'Submitted by partner for testing roles.',
-      }),
-      mk({
-        firstName: 'Daniel', lastName: 'Kovac', email: 'd.kovac@example.com', phone: '0455 202 303', location: 'Sydney, NSW',
-        currentEmployer: '', currentTitle: 'Security Architect', status: 'Cleared', availabilityDate: addDaysISO(30),
-        salary: { basis: 'Daily rate', amount: '1400' },
-        skills: [{ name: 'ISM', years: 10 }, { name: 'IRAP', years: 6 }, { name: 'Zero trust', years: 4 }],
-        certifications: [{ id: uid(), name: 'CISSP', issuer: 'ISC2', expiry: addDaysISO(-5) }],
-        clearance: { level: 'NV2', expiry: addDaysISO(80), issuingAgency: 'AGSVA', verification: 'Verified' },
-        visa: { workRights: 'Permanent resident', type: '', expiry: '', restrictions: '' },
-        source: { channel: 'Inbound', detail: 'Website application' },
-        consent: { given: true, date: addDaysISO(-60), method: 'Written form', collectionNoticeProvided: true },
-        screenings: [{ id: uid(), date: addDaysISO(-50), roleType: 'Security Architect', questionnaireId: null, answers: [], notes: 'IRAP assessor background.', outcome: 'Pass', ratings: [] }],
-        references: [ref('Mark Chen', 'CyberCX', 'Received')],
-      }),
-    ];
-    return {
-      candidates, questionnaires: [q1, q2],
-      audit: [{ id: uid(), at: now, user: 'System', action: 'Seeded demo data', candidateId: null, details: `${candidates.length} candidates` }],
-      session: { role: 'recruiter', userName: 'Recruitment Consultant', candidateId: null },
-    };
+    state = Object.assign(LHS.seed(), { session: state.session });
+    saveLocal();
+    notify();
   }
 
   LHS.store = {
-    load, subscribe, audit: (a, id, d) => { audit(a, id, d); save(); },
+    apiMode, load, subscribe, syncState, waitForSync,
+    audit, auditLog, fetchAuditLog,
     listCandidates, getCandidate, saveCandidate, updateCandidate, changeStatus, eraseCandidate, mergeInto,
+    saveBank, revealBank,
     listQuestionnaires, getQuestionnaire, saveQuestionnaire, deleteQuestionnaire,
-    session, setSession, auditLog, resetDemoData,
+    session, setSession, resetDemoData,
   };
 })(window.LHS);

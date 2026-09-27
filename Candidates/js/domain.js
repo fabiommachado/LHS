@@ -94,7 +94,7 @@ window.LHS = window.LHS || {};
     if (to === 'Active') {
       const ob = c.onboarding || {};
       ONBOARDING_DOCS.forEach((t) => { if (!hasDoc(c, t)) blockers.push(`Missing onboarding document: ${t}`); });
-      if (!ob.bank || !ob.bank.cipher) blockers.push('Bank details not recorded');
+      if (!ob.bank || !ob.bank.last4) blockers.push('Bank details not recorded');
       if (!ob.super || !ob.super.fundName) blockers.push('Superannuation fund details not recorded');
       MANDATORY_INDUCTIONS.forEach((i) => {
         if (!(c.inductions || []).some((x) => x.type === i && x.completedDate)) blockers.push(`${i} induction not completed`);
@@ -237,8 +237,8 @@ window.LHS = window.LHS || {};
     return Math.round((list.reduce((s, r) => s + r.weight * (Number(r.rating) || 0), 0) / max) * 100);
   }
 
-  // ---- Encryption of bank details (req 3.1.3 / 3.10.2) ----
-  // AES-256-GCM via Web Crypto. The key lives in this browser only; production must use server-side KMS.
+  // ---- Encryption of bank details, offline mode only (req 3.1.3 / 3.10.2) ----
+  // AES-256-GCM via Web Crypto with a key kept in this browser. When connected, the API encrypts on the server instead.
   const KEY_STORE = 'lhs.candidates.key';
   let keyPromise = null;
   const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));

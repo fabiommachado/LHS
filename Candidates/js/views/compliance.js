@@ -55,7 +55,7 @@ LHS.views = LHS.views || {};
   };
 
   LHS.views.audit = function (root) {
-    const log = LHS.store.auditLog();
+    let log = [];
     const names = Object.fromEntries(LHS.store.listCandidates().map((c) => [c.id, fullName(c)]));
     root.innerHTML = html`
       <div class="page-head"><h1 tabindex="-1">Audit log</h1></div>
@@ -73,8 +73,12 @@ LHS.views = LHS.views || {};
         <td>${a.candidateId ? (names[a.candidateId] ? html`<a href="#/candidates/${a.candidateId}">${names[a.candidateId]}</a>` : html`<span class="muted">[erased]</span>`) : ''}</td>
         <td class="small">${a.details}</td></tr>`)}`.s || html`<tr><td colspan="5">${empty('No entries.')}</td></tr>`.s;
     };
-    root.querySelector('#audit-q').addEventListener('input', debounce((e) => draw(e.target.value), 150));
-    draw('');
+    const input = root.querySelector('#audit-q');
+    input.addEventListener('input', debounce((e) => draw(e.target.value), 150));
+    rowsEl.innerHTML = html`<tr><td colspan="5" class="muted">Loading…</td></tr>`.s;
+    LHS.store.fetchAuditLog()
+      .then((entries) => { log = entries; if (rowsEl.isConnected) draw(input.value); })
+      .catch((e) => LHS.ui.toast(`Could not load the audit log: ${e.message}`, 'error'));
     return 'Audit log';
   };
 })(window.LHS);

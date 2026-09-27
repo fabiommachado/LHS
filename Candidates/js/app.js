@@ -81,8 +81,40 @@ window.LHS = window.LHS || {};
     LHS.app.navigated = true;
   }
 
-  function init() {
-    LHS.store.load();
+  // Header indicator for background saves (API mode).
+  function renderSyncStatus() {
+    const el = document.getElementById('sync-status');
+    const s = LHS.store.syncState();
+    if (!s.apiMode) { el.hidden = true; return; }
+    el.hidden = false;
+    el.className = 'sync ' + (s.pending ? 'sync-busy' : s.error ? 'sync-error' : 'sync-ok');
+    el.textContent = s.pending ? 'Saving…' : s.error ? 'Last change not saved' : 'All changes saved';
+  }
+
+  async function init() {
+    const main = document.getElementById('main');
+    main.innerHTML = html`<p class="muted" role="status">Loading candidates…</p>`.s;
+    try {
+      await LHS.store.load();
+    } catch (err) {
+      console.error(err);
+      main.innerHTML = html`<h1 tabindex="-1">Can't reach the Candidates API</h1>
+        <p class="errors">${err.message}</p>
+        <p>Check that the API is running (<code>dotnet run</code> in <code>Candidates/api</code>) and can reach the database, then reload.</p>
+        <p><button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button></p>`.s;
+      return;
+    }
+
+    if (LHS.store.apiMode) {
+      document.getElementById('footer-text').textContent =
+        'ICT Labour Hire System · Module 1: Candidate Lifecycle Management · Connected to the LHS database';
+      document.getElementById('reset-demo').hidden = true;
+    }
+    LHS.store.subscribe(renderSyncStatus);
+    renderSyncStatus();
+    window.addEventListener('beforeunload', (e) => {
+      if (LHS.store.syncState().pending) { e.preventDefault(); e.returnValue = ''; }
+    });
 
     // The skip link can't use href="#main" because the hash drives routing.
     document.querySelector('.skip-link').addEventListener('click', (e) => {

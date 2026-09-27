@@ -56,7 +56,7 @@ LHS.tabs = LHS.tabs || {};
 
         <section class="card">
           <h2>Bank details <span class="badge badge-ok" title="AES-256-GCM">Encrypted</span></h2>
-          ${ob.bank && ob.bank.cipher ? html`
+          ${ob.bank && ob.bank.last4 ? html`
             <dl class="dl"><div class="dl-row"><dt>Account</dt><dd id="bank-display">BSB ***-*** · Acct ****${ob.bank.last4}</dd></div></dl>
             <button type="button" class="btn btn-sm" data-action="revealBank">Reveal</button>
             <button type="button" class="btn btn-sm" data-action="editBank">Replace</button>`
@@ -101,7 +101,7 @@ LHS.tabs = LHS.tabs || {};
 
     LHS.tabs.onAction(el, {
       editBank: () => {
-        if (!D.cryptoAvailable()) { toast('Encryption is unavailable in this browser context; bank details cannot be stored.', 'error'); return; }
+        if (!LHS.store.apiMode && !D.cryptoAvailable()) { toast('Encryption is unavailable in this browser context; bank details cannot be stored.', 'error'); return; }
         dialog({
           title: 'Bank details',
           body: html`<div class="form-grid">
@@ -111,19 +111,18 @@ LHS.tabs = LHS.tabs || {};
           </div>`,
           submitLabel: 'Encrypt & save',
           onSubmit: async (v) => {
-            const enc = await D.encrypt({ accountName: v.accountName, bsb: v.bsb.replace('-', ''), account: v.account });
-            update((x) => { x.onboarding.bank = { ...enc, last4: v.account.slice(-4), updatedAt: new Date().toISOString() }; }, 'Updated bank details', 'Encrypted');
+            await LHS.store.saveBank(c.id, { accountName: v.accountName, bsb: v.bsb, account: v.account });
             toast('Bank details encrypted and saved', 'success');
+            refresh();
           },
         });
       },
       revealBank: async () => {
         try {
-          const b = await D.decrypt(ob.bank);
-          LHS.store.audit('Revealed bank details', c.id, fullName(c));
+          const b = await LHS.store.revealBank(c.id);
           el.querySelector('#bank-display').textContent = `${b.accountName} · BSB ${b.bsb.slice(0, 3)}-${b.bsb.slice(3)} · Acct ${b.account}`;
         } catch (e) {
-          toast('Could not decrypt. The encryption key isn\'t available in this browser.', 'error');
+          toast(LHS.store.apiMode ? `Could not reveal bank details: ${e.message}` : 'Could not decrypt. The encryption key isn\'t available in this browser.', 'error');
         }
       },
       generateAgreement: () => {
